@@ -23,7 +23,6 @@ const UA = 'Mozilla/5.0 (compatible; HashmarkNewsBot/1.0; +https://github.com/La
 
 /** College football feeds. A feed that fails is skipped; the rest still publish. */
 const FEEDS = [
-  { source: 'ESPN', url: 'https://www.espn.com/espn/rss/ncf/news' },
   { source: 'CBS Sports', url: 'https://www.cbssports.com/rss/headlines/college-football/' },
   { source: 'Yahoo Sports', url: 'https://sports.yahoo.com/college-football/rss.xml' },
   { source: 'NCAA.com', url: 'https://www.ncaa.com/news/football/fbs/rss.xml' },
@@ -32,7 +31,6 @@ const FEEDS = [
   { source: 'Saturday Down South', url: 'https://www.saturdaydownsouth.com/feed/' },
   { source: 'Saturday Tradition', url: 'https://www.saturdaytradition.com/feed/' },
   { source: 'Saturday Blitz', url: 'https://www.saturdayblitz.com/feed/' },
-  { source: 'Saturday Road', url: 'https://www.saturdayroad.com/feed/' },
   { source: 'College Football News', url: 'https://collegefootballnews.com/feed' },
   { source: 'On3', url: 'https://www.on3.com/feed/' },
 ];
@@ -161,6 +159,8 @@ function teamsIn(text) {
 // ---------- run ----------
 
 const cutoff = Date.now() - MAX_AGE_DAYS * 86400000;
+/** Sportsbook promotions and other sports that football feeds sometimes carry. */
+const NOISE = /promo code|bonus bets|sportsbook|betting promo|kalshi|polymarket|fanduel|draftkings|bet365|caesars|\bbasketball\b|\bhoops\b|\bNBA\b|\bWNBA\b|\bMLB\b|\bNHL\b|volleyball|\bsoccer\b|\bbaseball\b/i;
 const all = [];
 for (const feed of FEEDS) {
   try {
@@ -175,6 +175,7 @@ for (const feed of FEEDS) {
 
 const seen = new Set();
 let items = all
+  .filter((i) => !NOISE.test(i.title))
   .filter((i) => i.date && !Number.isNaN(i.date.getTime()) && i.date.getTime() >= cutoff && i.date.getTime() <= Date.now() + 3600000)
   .sort((a, b) => b.date - a.date)
   .filter((i) => {
