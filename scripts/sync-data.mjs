@@ -28,6 +28,8 @@ const SEASON = Number(process.env.SEASON ?? 2026);
 const KEY = process.env.CFBD_API_KEY;
 const WEEKLY = process.argv.includes('--weekly');
 const REFRESH = process.argv.includes('--refresh') || WEEKLY;
+/** CACHE_ONLY=1: build only from cached responses and fail rather than spend CFBD calls (used by the news runs). */
+const CACHE_ONLY = process.env.CACHE_ONLY === '1';
 /** In --weekly runs, these slow-changing caches are kept until they are this old. Saves ~140 CFBD calls a week. */
 const SLOW = /^(roster-|espn-roster-|coaches-)/;
 const SLOW_MAX_AGE_MS = 27 * 24 * 3600 * 1000;
@@ -59,6 +61,7 @@ async function cached(name, fetcher) {
 }
 
 async function cfbd(pathAndQuery, attempt = 1) {
+  if (CACHE_ONLY) throw new Error(`CACHE_ONLY is set but ${pathAndQuery} is not cached. Run without it (or the weekly job) first.`);
   const res = await fetch(CFBD + pathAndQuery, { headers: { Authorization: `Bearer ${KEY}` } });
   callsLeft = res.headers.get('x-calllimit-remaining') ?? callsLeft;
   if (res.status === 401) throw new Error('CFBD rejected the key (401). Check CFBD_API_KEY.');
@@ -432,7 +435,8 @@ await write('stats.json', { players: statsPlayers, teams: statsTeams });
 await write('meta.json', {
   season: SEASON,
   currentWeek,
-  generatedAt: new Date().toISOString(),
+  // When the scores were last pulled from CFBD (a cache-only rebuild keeps the original time).
+  generatedAt: statSync(path.join(CACHE, `games-${SEASON}.json`)).mtime.toISOString(),
   sources: ['collegefootballdata.com', 'site.api.espn.com (class year only)'],
 });
 

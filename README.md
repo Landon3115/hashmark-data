@@ -1,6 +1,6 @@
 # hashmark-data
 
-Weekly data for the Hashmark app. Every Sunday morning a GitHub Action runs `scripts/sync-data.mjs`, which pulls teams, scores, polls, ratings, rosters and head coaches from CollegeFootballData.com (plus class years from ESPN's public API) and publishes JSON files to this repository's GitHub Pages site under `/v1/`.
+Data for the Hashmark app. Every Sunday morning a GitHub Action runs `scripts/sync-data.mjs` (teams, scores, polls, ratings, rosters, head coaches and season stats from CollegeFootballData.com, plus class years from ESPN), and every 2 hours `scripts/sync-news.mjs` collects headlines from public college football RSS feeds. Everything is published as JSON on this repository's GitHub Pages site under `/v1/`.
 
 - Run it now: **Actions → Weekly data refresh → Run workflow**. Tick "full" to re-fetch rosters and coaches too.
 - The CFBD key lives only in the `CFBD_API_KEY` repository secret.

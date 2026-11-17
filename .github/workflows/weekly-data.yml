@@ -1,9 +1,11 @@
 name: Weekly data refresh
 
-# Sunday 9:00 AM Eastern (14:00 UTC in winter, 10 AM during daylight time), plus a "Run workflow" button.
+# Data (scores, polls, stats...): Sunday 9:00 AM Eastern (14:00 UTC; 10 AM during daylight time).
+# News: every 2 hours. News runs rebuild the data files from the cache and spend no CFBD calls.
 on:
   schedule:
     - cron: '0 14 * * 0'
+    - cron: '20 */2 * * *'
   workflow_dispatch:
     inputs:
       full:
@@ -28,7 +30,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # Keeps roster and coach responses between runs so a weekly run only spends ~10 CFBD calls.
+      # Keeps CFBD responses between runs: weekly runs spend ~12 calls, news runs none.
       - uses: actions/cache@v4
         with:
           path: scripts/.cache
@@ -38,11 +40,20 @@ jobs:
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
           OUT_DIR: site/v1
-        run: node scripts/sync-data.mjs ${{ inputs.full && '--refresh' || '--weekly' }}
+          CACHE_ONLY: ${{ github.event.schedule == '20 */2 * * *' && '1' || '0' }}
+        run: |
+          if [ "${{ github.event.schedule }}" = "20 */2 * * *" ]; then node scripts/sync-data.mjs
+          elif [ "${{ inputs.full }}" = "true" ]; then node scripts/sync-data.mjs --refresh
+          else node scripts/sync-data.mjs --weekly; fi
+      - name: Collect news
+        env:
+          OUT_DIR: site/v1
+          NEWS_DUMP: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: node scripts/sync-news.mjs
       - name: Index page
         run: |
           cp site/v1/meta.json site/meta.json
-          echo '<!doctype html><title>hashmark-data</title><p>Data files for the Hashmark app. Not official; source: CollegeFootballData.com.</p>' > site/index.html
+          echo '<!doctype html><title>hashmark-data</title><p>Data files for the Hashmark app. Not official; sources: CollegeFootballData.com and publisher RSS feeds.</p>' > site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
