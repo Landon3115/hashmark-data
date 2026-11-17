@@ -9,8 +9,8 @@
  *   SEASON=2026 sets the season (default 2026). OUT_DIR=some/folder writes the JSON there instead of the app.
  *
  * Sources
- *   CollegeFootballData.com (needs a free key; about 145 calls per full refresh, the free tier has 1,000 a month)
- *     teams, games and scores, polls, records, FPI ratings, head coaches, rosters
+ *   CollegeFootballData.com (needs a free key; about 150 calls per full refresh, the free tier has 1,000 a month)
+ *     teams, games and scores, polls, records, FPI ratings, head coaches, rosters, season player and team stats
  *   ESPN's unofficial public API (no key): class year for each player, which CFBD's roster lacks
  *
  * The key stays in this script's environment. It is never written to the app or to the output files.
@@ -134,6 +134,8 @@ const records = await cached(`records-${SEASON}`, () => cfbd(`/records?year=${SE
 const fpi = await cached(`fpi-${SEASON}`, () => cfbd(`/ratings/fpi?year=${SEASON}`));
 const polls = await cached(`rankings-${SEASON}`, () => cfbd(`/rankings?year=${SEASON}`));
 const coaches = await cached(`coaches-${SEASON}`, () => cfbd(`/coaches?minYear=2001&maxYear=${SEASON}`));
+const playerStats = await cached(`player-stats-${SEASON}`, () => cfbd(`/stats/player/season?year=${SEASON}`));
+const teamStats = await cached(`team-stats-${SEASON}`, () => cfbd(`/stats/season?year=${SEASON}`));
 console.log(`Core data loaded. CFBD calls left this month: ${callsLeft}`);
 
 // ---------- teams ----------
@@ -382,6 +384,40 @@ await pool(fbsOnly, 2, async (team, i) => {
   if ((i + 1) % 20 === 0) console.log(`  rosters ${i + 1}/${fbsOnly.length} (CFBD calls left: ${callsLeft})`);
 });
 
+// ---------- season stats ----------
+// Players: { [cfbd athlete id]: [teamSlug, name, position, { "passing.YDS": 3012, ... }] }, FBS players only.
+// Teams:   { [teamSlug]: { games, firstDowns, netPassingYards, ..., <name>Opponent } }, FBS teams only.
+const fbsSlugs = new Set(fbsOnly.map((t) => t.id));
+// Raw counts only; rates (completion %, yards per carry, averages) are worked out in the app.
+const KEEP_STATS = new Set([
+  'passing.COMPLETIONS', 'passing.ATT', 'passing.YDS', 'passing.TD', 'passing.INT',
+  'rushing.CAR', 'rushing.YDS', 'rushing.TD', 'rushing.LONG',
+  'receiving.REC', 'receiving.YDS', 'receiving.TD', 'receiving.LONG',
+  'defensive.TOT', 'defensive.SOLO', 'defensive.SACKS', 'defensive.TFL', 'defensive.PD', 'defensive.QB HUR', 'defensive.TD',
+  'interceptions.INT', 'interceptions.YDS', 'interceptions.TD',
+  'fumbles.FUM', 'fumbles.LOST', 'fumbles.REC',
+  'kicking.FGM', 'kicking.FGA', 'kicking.XPM', 'kicking.XPA', 'kicking.PTS', 'kicking.LONG',
+  'punting.NO', 'punting.YDS', 'punting.In 20', 'punting.TB', 'punting.LONG',
+  'kickReturns.NO', 'kickReturns.YDS', 'kickReturns.TD',
+  'puntReturns.NO', 'puntReturns.YDS', 'puntReturns.TD',
+]);
+const statsPlayers = {};
+for (const s of playerStats) {
+  const slug = slugBySchool.get(s.team);
+  if (!slug || !fbsSlugs.has(slug)) continue;
+  const key = `${s.category}.${s.statType}`;
+  const value = Number(s.stat);
+  if (!KEEP_STATS.has(key) || !Number.isFinite(value) || value === 0) continue;
+  const row = (statsPlayers[s.playerId] ??= [slug, s.player, s.position ?? '', {}]);
+  row[3][key] = value;
+}
+const statsTeams = {};
+for (const s of teamStats) {
+  const slug = slugBySchool.get(s.team);
+  if (!slug || !fbsSlugs.has(slug)) continue;
+  (statsTeams[slug] ??= {})[s.statName] = Number(s.statValue);
+}
+
 // ---------- write ----------
 
 const write = (name, value) => writeFile(path.join(OUT, name), JSON.stringify(value));
@@ -392,6 +428,7 @@ await write('ratings.json', ratingsOut);
 await write('polls.json', pollsOut);
 await write('coaches.json', coachesOut);
 await write('rosters.json', rostersOut);
+await write('stats.json', { players: statsPlayers, teams: statsTeams });
 await write('meta.json', {
   season: SEASON,
   currentWeek,
@@ -401,6 +438,7 @@ await write('meta.json', {
 
 console.log(
   `Done. ${teams.length} teams (${fbsOnly.length} FBS), ${games.length} games, ${playerCount} players ` +
-    `(${classHits} with a class year), ${Object.keys(coachesOut).length} head coaches. Current week: ${currentWeek}. ` +
+    `(${classHits} with a class year), ${Object.keys(coachesOut).length} head coaches, season stats for ` +
+    `${Object.keys(statsPlayers).length} players and ${Object.keys(statsTeams).length} teams. Current week: ${currentWeek}. ` +
     `CFBD calls left this month: ${callsLeft}`,
 );
