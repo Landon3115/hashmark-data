@@ -1,10 +1,12 @@
 name: Weekly data refresh
 
-# Data (scores, polls, stats...): Sunday 9:00 AM Eastern (14:00 UTC; 10 AM during daylight time).
+# Data (scores, polls, stats...): Sunday 9:00 AM Eastern (14:00 UTC; 10 AM during daylight time), and again
+# Wednesday 8:00 AM Eastern to pick up the CFP rankings released Tuesday night.
 # News: every 2 hours. News runs rebuild the data files from the cache and spend no CFBD calls.
 on:
   schedule:
     - cron: '0 14 * * 0'
+    - cron: '0 13 * * 3'
     - cron: '20 */2 * * *'
   workflow_dispatch:
     inputs:
