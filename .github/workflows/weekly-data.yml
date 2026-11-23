@@ -38,6 +38,9 @@ jobs:
           path: scripts/.cache
           key: cfbd-cache-${{ github.run_id }}
           restore-keys: cfbd-cache-
+      # Past seasons and finished weeks, fetched once and kept here so they never cost CFBD calls again.
+      - name: Seed cache
+        run: mkdir -p scripts/.cache && cp -n seed/*.json scripts/.cache/ || true
       - name: Pull data
         env:
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}

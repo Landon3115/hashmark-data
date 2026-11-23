@@ -60,6 +60,18 @@ async function cached(name, fetcher) {
   return value;
 }
 
+/**
+ * For data that no longer changes (finished weeks, past seasons): fetched once, then always read from the cache,
+ * even in --weekly and --refresh runs. Delete the cache file to fetch it again.
+ */
+async function cachedStable(name, fetcher) {
+  const file = path.join(CACHE, `${name.replace(/[^a-z0-9._-]+/gi, '_')}.json`);
+  if (existsSync(file)) return JSON.parse(await readFile(file, 'utf8'));
+  const value = await fetcher();
+  await writeFile(file, JSON.stringify(value));
+  return value;
+}
+
 async function cfbd(pathAndQuery, attempt = 1) {
   if (CACHE_ONLY) throw new Error(`CACHE_ONLY is set but ${pathAndQuery} is not cached. Run without it (or the weekly job) first.`);
   const res = await fetch(CFBD + pathAndQuery, { headers: { Authorization: `Bearer ${KEY}` } });
@@ -421,6 +433,122 @@ for (const s of teamStats) {
   (statsTeams[slug] ??= {})[s.statName] = Number(s.statValue);
 }
 
+// ---------- game details: scoring plays and team box scores ----------
+// One CFBD call per week for each. A week whose games all finished more than 4 days ago is cached for good.
+// gamedetails.json: { [gameId]: { p: [[quarter, "3:38", "h"|"a", text, homeScore, awayScore]], s: { h: {...}, a: {...} } } }
+
+const weekKeys = [...new Set(games.filter((g) => g.done).map((g) => g.w))].sort((a, b) => a - b);
+const weekQuery = (w) => (w >= 100 ? `year=${SEASON}&week=${w - 100}&seasonType=postseason` : `year=${SEASON}&week=${w}`);
+const settled = (w) => games.filter((g) => g.w === w).every((g) => g.done && Date.now() - new Date(g.d).getTime() > 4 * 86400000);
+const gameIds = new Set(games.map((g) => g.id));
+const details = {};
+const detailFor = (id) => (details[id] ??= { p: [], s: {} });
+
+const BOX_KEYS = [
+  'totalYards', 'netPassingYards', 'rushingYards', 'rushingAttempts', 'completionAttempts', 'yardsPerPass',
+  'yardsPerRushAttempt', 'firstDowns', 'thirdDownEff', 'fourthDownEff', 'turnovers', 'fumblesLost', 'interceptions',
+  'totalPenaltiesYards', 'possessionTime', 'sacks', 'tacklesForLoss',
+];
+let scoringMismatch = 0;
+/** Play-by-play text minus the clutter: formation, jersey numbers, holder and snapper, clock stamps. */
+const cleanPlay = (s) =>
+  s
+    .replace(/^\(\d{1,2}:\d{2}\)\s*/, '')
+    .replace(/\b(No Huddle-?)?(Shotgun|Pistol|Under Center)\b\s*/gi, '')
+    .replace(/No Huddle-?\s*/gi, '')
+    .replace(/#\d+\s*/g, '')
+    .replace(/,?\s*clock \d{1,2}:\d{2}/gi, '')
+    .replace(/\s*\((H|LS):[^)]*\)/g, '')
+    .replace(/\s*caught at [A-Za-z ]*?\d+,?/g, '')
+    .replace(/\s+to the [A-Za-z]+ ?\d+ (TOUCHDOWN|TD)\b/g, ' for a TD')
+    .replace(/\bTOUCHDOWN\b/g, 'TD')
+    .replace(/,?\s*1ST DOWN\b/gi, '')
+    .replace(/yards? gain/gi, 'yards')
+    .replace(/(\S+) field goal attempt from (\d+) yards GOOD/gi, '$1 $2-yard field goal')
+    .replace(/,?\s*([A-Z][a-z]?\.\s?[A-Za-z'’-]+(?: [A-Z][A-Za-z'’-]+)*) kick attempt good/g, ' ($1 kick)')
+    .replace(/\s*PENALTY.*$/, '')
+    .replace(/(\([^)]+\))(\s*\1)+/g, '$1')
+    .replace(/(rush|pass) attempt successful/gi, '2-pt try good')
+    .replace(/(rush|pass) attempt failed/gi, '2-pt try failed')
+    .replace(/,\s*,/g, ',')
+    .replace(/\s+/g, ' ')
+    .replace(/[\s,]+$/, '')
+    .trim()
+    .slice(0, 220);
+for (const w of weekKeys) {
+  const fetchBox = async () =>
+    (await cfbd(`/games/teams?${weekQuery(w)}`)).map((g) => ({
+      id: String(g.id),
+      teams: g.teams.map((tm) => ({ side: tm.homeAway === 'home' ? 'h' : 'a', stats: Object.fromEntries(tm.stats.map((s) => [s.category, s.stat])) })),
+    }));
+  const fetchPlays = async () =>
+    (await cfbd(`/plays?${weekQuery(w)}`))
+      .filter((pl) => pl.scoring)
+      .map((pl) => {
+        const homeOff = pl.offense === pl.home;
+        return [String(pl.gameId), Number(pl.id), pl.period, pl.clock?.minutes ?? 0, pl.clock?.seconds ?? 0,
+          homeOff ? pl.offenseScore : pl.defenseScore, homeOff ? pl.defenseScore : pl.offenseScore, pl.playType, pl.playText ?? ''];
+      });
+  const stable = settled(w);
+  const box = await (stable ? cachedStable : cached)(`box-${SEASON}-w${w}`, fetchBox);
+  const plays = await (stable ? cachedStable : cached)(`scoring-${SEASON}-w${w}`, fetchPlays);
+
+  for (const g of box) {
+    if (!gameIds.has(g.id)) continue;
+    for (const tm of g.teams) detailFor(g.id).s[tm.side] = Object.fromEntries(BOX_KEYS.filter((k) => k in tm.stats).map((k) => [k, tm.stats[k]]));
+  }
+
+  const byGame = new Map();
+  for (const pl of plays) if (gameIds.has(pl[0])) (byGame.get(pl[0]) ?? byGame.set(pl[0], []).get(pl[0])).push(pl);
+  for (const [id, list] of byGame) {
+    // Chronological: by quarter, then clock counting down, then play id. The scoring team is whichever score went up.
+    list.sort((x, y) => x[2] - y[2] || y[3] * 60 + y[4] - (x[3] * 60 + x[4]) || x[1] - y[1]);
+    let ph = 0;
+    let pa = 0;
+    for (const [, , q, m, s, hs, as, , text] of list) {
+      if (hs == null || as == null || hs < ph || as < pa || (hs === ph && as === pa)) continue;
+      const side = hs > ph && as === pa ? 'h' : as > pa && hs === ph ? 'a' : null;
+      if (!side) continue;
+      detailFor(id).p.push([q, `${m}:${String(s).padStart(2, '0')}`, side, cleanPlay(text), hs, as]);
+      ph = hs;
+      pa = as;
+    }
+    const g = games.find((x) => x.id === id);
+    if (g?.done && (ph !== g.hp || pa !== g.ap)) scoringMismatch += 1;
+  }
+}
+
+// ---------- head-to-head history ----------
+// Every past season's games, one CFBD call per season, fetched once (seasons before this one don't change).
+// h2h.json: { "slugA|slugB" (sorted): [[season, "YYYY-MM-DD", homeSlug, awaySlug, homePoints, awayPoints, neutral]] }
+// for the pairs that meet this season. This season's own games come from games.json in the app.
+
+const FIRST_SEASON = 1869;
+const fbsIds = new Set(fbsTeams.map((t) => t.id));
+const pairsThisSeason = new Set(games.map((g) => [g.h, g.a].sort().join('|')));
+const h2h = {};
+const seasons = Array.from({ length: SEASON - FIRST_SEASON }, (_, i) => FIRST_SEASON + i);
+const history = await pool(seasons, 3, (y) =>
+  cachedStable(`history-${y}`, async () =>
+    (await cfbd(`/games?year=${y}&seasonType=both`))
+      .filter((g) => g.homePoints != null && g.awayPoints != null && (fbsIds.has(g.homeId) || fbsIds.has(g.awayId)))
+      .map((g) => [y, (g.startDate ?? '').slice(0, 10), g.homeId, g.awayId, g.homePoints, g.awayPoints, g.neutralSite ? 1 : 0]),
+  ),
+);
+let h2hGames = 0;
+for (const season of history) {
+  for (const [y, d, hid, aid, hp, ap, n] of season) {
+    const h = slugByCfbdId.get(hid);
+    const a = slugByCfbdId.get(aid);
+    if (!h || !a) continue;
+    const key = [h, a].sort().join('|');
+    if (!pairsThisSeason.has(key)) continue;
+    (h2h[key] ??= []).push([y, d, h, a, hp, ap, n]);
+    h2hGames += 1;
+  }
+}
+for (const list of Object.values(h2h)) list.sort((x, y) => y[1].localeCompare(x[1]));
+
 // ---------- write ----------
 
 const write = (name, value) => writeFile(path.join(OUT, name), JSON.stringify(value));
@@ -432,6 +560,8 @@ await write('polls.json', pollsOut);
 await write('coaches.json', coachesOut);
 await write('rosters.json', rostersOut);
 await write('stats.json', { players: statsPlayers, teams: statsTeams });
+await write('gamedetails.json', details);
+await write('h2h.json', h2h);
 await write('meta.json', {
   season: SEASON,
   currentWeek,
@@ -443,6 +573,8 @@ await write('meta.json', {
 console.log(
   `Done. ${teams.length} teams (${fbsOnly.length} FBS), ${games.length} games, ${playerCount} players ` +
     `(${classHits} with a class year), ${Object.keys(coachesOut).length} head coaches, season stats for ` +
-    `${Object.keys(statsPlayers).length} players and ${Object.keys(statsTeams).length} teams. Current week: ${currentWeek}. ` +
+    `${Object.keys(statsPlayers).length} players and ${Object.keys(statsTeams).length} teams, details for ` +
+    `${Object.keys(details).length} games (${scoringMismatch} whose scoring plays don't add up to the final), ` +
+    `${h2hGames} past meetings for ${Object.keys(h2h).length} of ${pairsThisSeason.size} matchups. Current week: ${currentWeek}. ` +
     `CFBD calls left this month: ${callsLeft}`,
 );
