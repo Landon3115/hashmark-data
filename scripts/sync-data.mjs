@@ -518,6 +518,149 @@ for (const w of weekKeys) {
   }
 }
 
+// ---------- TV, pregame win probability, player game stats, advanced stats, player history ----------
+
+// TV network for each game (1 call). Shown on game rows and the game page.
+const media = await cached(`media-${SEASON}`, async () =>
+  (await cfbd(`/games/media?year=${SEASON}&seasonType=both`))
+    .filter((m) => m.mediaType === 'tv' && m.outlet)
+    .map((m) => [String(m.id), m.outlet]),
+);
+const tvById = new Map();
+for (const [id, outlet] of media) if (!tvById.has(id)) tvById.set(id, outlet);
+for (const g of games) if (tvById.has(g.id)) g.tv = tvById.get(g.id);
+
+// Pregame win probability from the betting line, for games not played yet (1 call per upcoming week).
+const upcomingWeeks = [...new Set(games.filter((g) => !g.done).map((g) => g.w))];
+for (const w of upcomingWeeks) {
+  const rows = await cached(`pregame-wp-${SEASON}-w${w}`, async () =>
+    (await cfbd(`/metrics/wp/pregame?${weekQuery(w)}`)).map((r) => [String(r.gameId), r.homeWinProbability, r.spread]),
+  );
+  for (const [id, p, spread] of rows) {
+    const g = games.find((x) => x.id === id);
+    if (g && p != null) {
+      g.wp = Math.round(p * 1000) / 1000;
+      if (spread != null) g.sp = spread;
+    }
+  }
+}
+
+// Season advanced team stats (1 call): EPA per play, success rate, explosiveness, havoc, points per scoring opportunity.
+const seasonAdv = await cached(`season-adv-${SEASON}`, async () =>
+  (await cfbd(`/stats/season/advanced?year=${SEASON}`)).map((r) => ({
+    team: r.team,
+    o: [r.offense?.ppa, r.offense?.successRate, r.offense?.explosiveness, r.offense?.pointsPerOpportunity, r.offense?.rushingPlays?.ppa, r.offense?.passingPlays?.ppa],
+    d: [r.defense?.ppa, r.defense?.successRate, r.defense?.explosiveness, r.defense?.pointsPerOpportunity, r.defense?.havoc?.total],
+  })),
+);
+const round3 = (x) => (typeof x === 'number' && Number.isFinite(x) ? Math.round(x * 1000) / 1000 : null);
+for (const r of seasonAdv) {
+  const slug = slugBySchool.get(r.team);
+  if (!slug || !statsTeams[slug]) continue;
+  statsTeams[slug].adv = { o: r.o.map(round3), d: r.d.map(round3) };
+}
+
+// Player box scores and advanced team stats for every finished week (1 call each per week, cached for good once settled).
+const KEEP_GAME = {
+  passing: ['C/ATT', 'YDS', 'TD', 'INT'],
+  rushing: ['CAR', 'YDS', 'TD', 'LONG'],
+  receiving: ['REC', 'YDS', 'TD', 'LONG'],
+  defensive: ['TOT', 'SOLO', 'SACKS', 'TFL', 'PD'],
+  interceptions: ['INT', 'YDS', 'TD'],
+  kicking: ['FG', 'XP', 'PTS', 'LONG'],
+  punting: ['NO', 'AVG'],
+};
+/** athlete id -> [[gameId, opponent slug, "h"|"a", { "passing.YDS": "291", ... }]] (written to playerlogs.json, loaded on demand) */
+const playerLogs = {};
+/** "2 TD", or nothing when the count is zero. */
+const opt = (n, label) => (Number.parseFloat(n) > 0 ? `${n} ${label}` : '');
+const line = (...parts) => parts.filter(Boolean).join(', ');
+const nameById = {};
+for (const w of weekKeys) {
+  const stable = settled(w);
+  const box = await (stable ? cachedStable : cached)(`players-${SEASON}-w${w}`, async () =>
+    (await cfbd(`/games/players?${weekQuery(w)}`)).map((g) => ({
+      id: String(g.id),
+      teams: g.teams.map((tm) => ({
+        side: tm.homeAway === 'home' ? 'h' : 'a',
+        cats: Object.fromEntries(
+          tm.categories
+            .filter((c) => KEEP_GAME[c.name])
+            .map((c) => [c.name, Object.fromEntries(c.types.filter((ty) => KEEP_GAME[c.name].includes(ty.name)).map((ty) => [ty.name, ty.athletes.map((a) => [a.id, a.name, a.stat])]))]),
+        ),
+      })),
+    })),
+  );
+  for (const g of box) {
+    const game = games.find((x) => x.id === g.id);
+    if (!game) continue;
+    for (const tm of g.teams) {
+      const opp = tm.side === 'h' ? game.a : game.h;
+      const lines = {};
+      for (const [cat, types] of Object.entries(tm.cats)) {
+        for (const [type, athletes] of Object.entries(types)) {
+          for (const [aid, name, stat] of athletes) {
+            if (aid == null || Number(aid) < 0 || stat == null || stat === '0' || stat === '0/0' || stat === '0.0') continue;
+            nameById[aid] = name;
+            (lines[aid] ??= {})[`${cat}.${type}`] = stat;
+          }
+        }
+      }
+      for (const [aid, s] of Object.entries(lines)) (playerLogs[aid] ??= []).push([g.id, opp, tm.side, s]);
+      // Game page leaders: [athlete id, name, line] per category.
+      const top = (cat, key, count, fmt) =>
+        Object.entries(lines)
+          .filter(([, s]) => s[`${cat}.${key}`] != null)
+          .sort((x, y) => Number.parseFloat(y[1][`${cat}.${key}`]) - Number.parseFloat(x[1][`${cat}.${key}`]))
+          .slice(0, count)
+          .map(([aid, s]) => [aid, nameById[aid], fmt((k) => s[`${cat}.${k}`] ?? '0')]);
+      detailFor(g.id).l ??= {};
+      detailFor(g.id).l[tm.side] = {
+        pass: top('passing', 'YDS', 2, (v) => line(`${v('C/ATT')}`, `${v('YDS')} yds`, opt(v('TD'), 'TD'), opt(v('INT'), 'INT'))),
+        rush: top('rushing', 'YDS', 3, (v) => line(`${v('CAR')} car`, `${v('YDS')} yds`, opt(v('TD'), 'TD'))),
+        rec: top('receiving', 'YDS', 3, (v) => line(`${v('REC')} rec`, `${v('YDS')} yds`, opt(v('TD'), 'TD'))),
+        def: top('defensive', 'TOT', 3, (v) => line(`${v('TOT')} tkl`, opt(v('SACKS'), 'sk'), opt(v('TFL'), 'TFL'))),
+      };
+    }
+  }
+
+  const adv = await (stable ? cachedStable : cached)(`game-adv-${SEASON}-w${w}`, async () =>
+    (await cfbd(`/stats/game/advanced?${weekQuery(w)}`)).map((r) => [
+      String(r.gameId), r.team,
+      r.offense?.ppa, r.offense?.successRate, r.offense?.explosiveness, r.offense?.rushingPlays?.ppa, r.offense?.passingPlays?.ppa, r.offense?.plays,
+    ]),
+  );
+  for (const [id, team, ...vals] of adv) {
+    const game = games.find((x) => x.id === id);
+    const slug = slugBySchool.get(team);
+    if (!game || !slug) continue;
+    const side = slug === game.h ? 'h' : slug === game.a ? 'a' : null;
+    if (side) (detailFor(id).x ??= {})[side] = vals.map(round3);
+  }
+}
+for (const list of Object.values(playerLogs)) list.sort((x, y) => (games.find((g) => g.id === x[0])?.d ?? '').localeCompare(games.find((g) => g.id === y[0])?.d ?? ''));
+
+// Earlier seasons for players on this season's rosters (1 call per season, fetched once).
+const HISTORY_FROM = SEASON - 4;
+const rosterIds = new Set(Object.values(rostersOut).flatMap((rows) => rows.map((r) => String(r[0]))));
+/** athlete id -> [[season, team slug or school name, { "passing.YDS": 3012, ... }]] (playerhistory.json, loaded on demand) */
+const playerHistory = {};
+for (let y = HISTORY_FROM; y < SEASON; y++) {
+  // Cached trimmed to [player id, school, "category.stat", value]: the full response is about 25 MB a season.
+  const rows = await cachedStable(`player-season-${y}`, async () =>
+    (await cfbd(`/stats/player/season?year=${y}`))
+      .map((s) => [String(s.playerId), s.team, `${s.category}.${s.statType}`, Number(s.stat)])
+      .filter(([, , key, v]) => KEEP_STATS.has(key) && Number.isFinite(v) && v !== 0),
+  );
+  const byPlayer = {};
+  for (const [id, team, key, v] of rows) {
+    if (!rosterIds.has(id)) continue;
+    const row = (byPlayer[id] ??= [y, slugBySchool.get(team) ?? team, {}]);
+    row[2][key] = v;
+  }
+  for (const [id, row] of Object.entries(byPlayer)) (playerHistory[id] ??= []).push(row);
+}
+
 // ---------- head-to-head history ----------
 // Every past season's games, one CFBD call per season, fetched once (seasons before this one don't change).
 // h2h.json: { "slugA|slugB" (sorted): [[season, "YYYY-MM-DD", homeSlug, awaySlug, homePoints, awayPoints, neutral]] }
@@ -561,6 +704,8 @@ await write('coaches.json', coachesOut);
 await write('rosters.json', rostersOut);
 await write('stats.json', { players: statsPlayers, teams: statsTeams });
 await write('gamedetails.json', details);
+await write('playerlogs.json', playerLogs);
+await write('playerhistory.json', playerHistory);
 await write('h2h.json', h2h);
 await write('meta.json', {
   season: SEASON,
@@ -575,6 +720,7 @@ console.log(
     `(${classHits} with a class year), ${Object.keys(coachesOut).length} head coaches, season stats for ` +
     `${Object.keys(statsPlayers).length} players and ${Object.keys(statsTeams).length} teams, details for ` +
     `${Object.keys(details).length} games (${scoringMismatch} whose scoring plays don't add up to the final), ` +
+    `game logs for ${Object.keys(playerLogs).length} players, past seasons for ${Object.keys(playerHistory).length}, ` +
     `${h2hGames} past meetings for ${Object.keys(h2h).length} of ${pairsThisSeason.size} matchups. Current week: ${currentWeek}. ` +
     `CFBD calls left this month: ${callsLeft}`,
 );
