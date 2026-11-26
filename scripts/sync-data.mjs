@@ -561,14 +561,19 @@ for (const r of seasonAdv) {
 }
 
 // Player box scores and advanced team stats for every finished week (1 call each per week, cached for good once settled).
+// Everything the app's player rating formula (src/data/ratings.ts in the app) reads, so season ratings can be
+// worked out from playerlogs.json. Cached as pbox-*: the older players-* caches kept fewer stats.
 const KEEP_GAME = {
   passing: ['C/ATT', 'YDS', 'TD', 'INT'],
   rushing: ['CAR', 'YDS', 'TD', 'LONG'],
   receiving: ['REC', 'YDS', 'TD', 'LONG'],
-  defensive: ['TOT', 'SOLO', 'SACKS', 'TFL', 'PD'],
+  fumbles: ['LOST', 'REC'],
+  defensive: ['TOT', 'SOLO', 'SACKS', 'TFL', 'PD', 'QB HUR', 'TD'],
   interceptions: ['INT', 'YDS', 'TD'],
   kicking: ['FG', 'XP', 'PTS', 'LONG'],
-  punting: ['NO', 'AVG'],
+  punting: ['NO', 'AVG', 'In 20'],
+  kickReturns: ['YDS', 'TD'],
+  puntReturns: ['YDS', 'TD'],
 };
 /** athlete id -> [[gameId, opponent slug, "h"|"a", { "passing.YDS": "291", ... }]] (written to playerlogs.json, loaded on demand) */
 const playerLogs = {};
@@ -578,7 +583,7 @@ const line = (...parts) => parts.filter(Boolean).join(', ');
 const nameById = {};
 for (const w of weekKeys) {
   const stable = settled(w);
-  const box = await (stable ? cachedStable : cached)(`players-${SEASON}-w${w}`, async () =>
+  const box = await (stable ? cachedStable : cached)(`pbox-${SEASON}-w${w}`, async () =>
     (await cfbd(`/games/players?${weekQuery(w)}`)).map((g) => ({
       id: String(g.id),
       teams: g.teams.map((tm) => ({
