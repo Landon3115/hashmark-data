@@ -147,6 +147,8 @@ const post = await cached(`games-post-${SEASON}`, () =>
 );
 const records = await cached(`records-${SEASON}`, () => cfbd(`/records?year=${SEASON}`));
 const fpi = await cached(`fpi-${SEASON}`, () => cfbd(`/ratings/fpi?year=${SEASON}`));
+// SP+ offense and defense ratings: the app adjusts season player ratings for the opponent's unit with these.
+const sp = await cached(`sp-${SEASON}`, () => cfbd(`/ratings/sp?year=${SEASON}`));
 const polls = await cached(`rankings-${SEASON}`, () => cfbd(`/rankings?year=${SEASON}`));
 const coaches = await cached(`coaches-${SEASON}`, () => cfbd(`/coaches?minYear=2001&maxYear=${SEASON}`));
 const playerStats = await cached(`player-stats-${SEASON}`, () => cfbd(`/stats/player/season?year=${SEASON}`));
@@ -241,10 +243,14 @@ for (const r of records) {
 }
 
 const ratingsOut = [];
+const spByTeam = new Map(sp.filter((r) => r.offense?.rating != null && r.defense?.rating != null).map((r) => [r.team, r]));
 for (const r of fpi) {
   const slug = slugBySchool.get(r.team);
   if (!slug) continue;
+  const s = spByTeam.get(r.team);
   ratingsOut.push({
+    // SP+ offense (points scored vs an average defense, higher is better) and defense (lower is better).
+    ...(s ? { spO: s.offense.rating, spD: s.defense.rating } : {}),
     id: slug,
     fpi: r.fpi,
     fpiRank: r.resumeRanks?.fpi ?? null,
@@ -596,6 +602,12 @@ for (const w of weekKeys) {
       })),
     })),
   );
+  // Each player's EPA per play this week (garbage time left out), for the app's season ratings. Offense only.
+  const ppa = new Map(
+    await (stable ? cachedStable : cached)(`ppa-${SEASON}-w${w}`, async () =>
+      (await cfbd(`/ppa/players/games?${weekQuery(w)}&excludeGarbageTime=true`)).map((p) => [String(p.id), p.averagePPA?.all ?? null]),
+    ),
+  );
   for (const g of box) {
     const game = games.find((x) => x.id === g.id);
     if (!game) continue;
@@ -611,7 +623,11 @@ for (const w of weekKeys) {
           }
         }
       }
-      for (const [aid, s] of Object.entries(lines)) (playerLogs[aid] ??= []).push([g.id, opp, tm.side, s]);
+      for (const [aid, s] of Object.entries(lines)) {
+        const epa = ppa.get(String(aid));
+        if (epa != null && Number.isFinite(epa)) s['ppa.ALL'] = String(Math.round(epa * 1000) / 1000);
+        (playerLogs[aid] ??= []).push([g.id, opp, tm.side, s]);
+      }
       // Game page leaders: [athlete id, name, line] per category.
       const top = (cat, key, count, fmt) =>
         Object.entries(lines)
